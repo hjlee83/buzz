@@ -119,6 +119,9 @@ enum CliError {
 
 #[tokio::main]
 async fn main() {
+    // tokio-tungstenite can see multiple rustls crypto backends through the workspace.
+    // Install the CLI's selected provider explicitly before any TLS connection is opened.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     if let Err(e) = run(cli.command).await {
         eprintln!("error: {e}");
