@@ -13,6 +13,7 @@
 //! over a live Nostr relay.
 
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use buzz_core::kind::KIND_PAIRING;
@@ -26,6 +27,9 @@ use buzz_core::pairing::{
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use nostr::{Event, EventBuilder, Keys, RelayUrl, SecretKey, ToBech32};
+use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use zeroize::Zeroizing;
@@ -51,8 +55,27 @@ enum Cmd {
         relay: String,
 
         /// nsec (bech32) of the key to transfer. If omitted, generates a test key.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "nsec_file")]
         nsec: Option<String>,
+
+        /// Read an existing secret key from a local file and send a Buzz mobile credential payload.
+        #[arg(long, conflicts_with = "nsec", requires = "credential_relay_url")]
+        nsec_file: Option<PathBuf>,
+
+        /// HTTPS relay origin embedded in the Buzz mobile credential payload.
+        #[arg(long, requires = "nsec_file")]
+        credential_relay_url: Option<String>,
+
+        /// Optional local HTTP bind address for source-side SAS approval.
+        /// When set, the source waits for an explicit approval from the short-lived web page
+        /// instead of reading y/n from stdin.
+        #[arg(long, requires = "approval_public_url")]
+        approval_listen: Option<String>,
+
+        /// Public HTTPS base URL reverse-proxied to --approval-listen.
+        /// A random one-shot token is appended to this URL for each pairing session.
+        #[arg(long, requires = "approval_listen")]
+        approval_public_url: Option<String>,
     },
 
     /// Act as the target device (scans QR code, receives the secret).
@@ -105,15 +128,40 @@ async fn main() {
 
 async fn run(cmd: Cmd) -> Result<(), CliError> {
     match cmd {
-        Cmd::Source { relay, nsec } => cmd_source(relay, nsec).await,
+        Cmd::Source {
+            relay,
+            nsec,
+            nsec_file,
+            credential_relay_url,
+            approval_listen,
+            approval_public_url,
+        } => {
+            cmd_source(
+                relay,
+                nsec,
+                nsec_file,
+                credential_relay_url,
+                approval_listen,
+                approval_public_url,
+            )
+            .await
+        }
         Cmd::Target { relay, show_secret } => cmd_target(relay, show_secret).await,
         Cmd::TestVectors => cmd_test_vectors(),
     }
 }
 
-async fn cmd_source(relay_url: String, nsec: Option<String>) -> Result<(), CliError> {
+async fn cmd_source(
+    relay_url: String,
+    nsec: Option<String>,
+    nsec_file: Option<PathBuf>,
+    credential_relay_url: Option<String>,
+    approval_listen: Option<String>,
+    approval_public_url: Option<String>,
+) -> Result<(), CliError> {
     // Resolve the payload to transfer.
-    let (payload_str, payload_type) = resolve_payload(nsec)?;
+    let (payload_str, payload_type) =
+        resolve_source_payload(nsec, nsec_file, credential_relay_url)?;
 
     // Create pairing session.
     let (mut session, qr) = PairingSession::new_source(relay_url.clone());
@@ -155,10 +203,18 @@ async fn cmd_source(relay_url: String, nsec: Option<String>) -> Result<(), CliEr
     };
     println!("Offer received from target.");
     println!("SAS code: {sas}");
-    print!("Does your other device show {sas}? [y/n]: ");
-    io::stdout().flush()?;
 
-    let confirmed = read_yes_no()?;
+    let confirmed = match (approval_listen.as_deref(), approval_public_url.as_deref()) {
+        (Some(bind), Some(public_base)) => {
+            wait_for_web_sas_confirmation(bind, public_base, &sas, Duration::from_secs(120)).await?
+        }
+        (None, None) => {
+            print!("Does your other device show {sas}? [y/n]: ");
+            io::stdout().flush()?;
+            read_yes_no()?
+        }
+        _ => unreachable!("clap requires approval options together"),
+    };
     if !confirmed {
         // Send abort and exit.
         if let Some(abort_event) =
@@ -198,6 +254,101 @@ async fn cmd_source(relay_url: String, nsec: Option<String>) -> Result<(), CliEr
 
     println!("Transfer complete! ✓");
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalRequest {
+    Page,
+    Approve,
+    Deny,
+    NotFound,
+}
+
+fn classify_approval_request(method: &str, path: &str, token: &str) -> ApprovalRequest {
+    let path = path.split('?').next().unwrap_or_default();
+    let approve_suffix = format!("/{token}/approve");
+    let deny_suffix = format!("/{token}/deny");
+    let page_suffix = format!("/{token}");
+
+    match method {
+        "GET" if path.ends_with(&page_suffix) => ApprovalRequest::Page,
+        "POST" if path.ends_with(&approve_suffix) => ApprovalRequest::Approve,
+        "POST" if path.ends_with(&deny_suffix) => ApprovalRequest::Deny,
+        _ => ApprovalRequest::NotFound,
+    }
+}
+
+async fn wait_for_web_sas_confirmation(
+    bind: &str,
+    public_base: &str,
+    sas: &str,
+    ttl: Duration,
+) -> Result<bool, CliError> {
+    validate_https_url("--approval-public-url", public_base)?;
+    let listener = TcpListener::bind(bind).await?;
+    let token = Keys::generate().public_key().to_hex();
+    let approval_url = format!("{}/{}", public_base.trim_end_matches('/'), token);
+    println!("Open this source approval page and compare the SAS code:");
+    println!("{approval_url}");
+
+    timeout(ttl, async {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                continue;
+            }
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let request_line = request.lines().next().unwrap_or_default();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default();
+            let path = parts.next().unwrap_or_default();
+
+            match classify_approval_request(method, path, &token) {
+                ApprovalRequest::Page => {
+                    let body = format!(
+                        "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'\"><title>Buzz pairing approval</title></head><body style=\"font-family:system-ui;max-width:36rem;margin:3rem auto;padding:0 1rem\"><h1>Buzz pairing</h1><p>iPhone Buzz에 표시된 코드와 아래 코드가 같은지 확인하세요.</p><div style=\"font-size:2.4rem;font-weight:700;letter-spacing:.18em;margin:2rem 0\">{sas}</div><form method=\"post\" action=\"{approval_url}/approve\"><button style=\"font-size:1.2rem;padding:.9rem 1.2rem;width:100%\">Codes match — 승인</button></form><form method=\"post\" action=\"{approval_url}/deny\" style=\"margin-top:1rem\"><button style=\"font-size:1rem;padding:.7rem 1rem;width:100%\">코드가 다름 — 취소</button></form></body></html>"
+                    );
+                    write_http_response(&mut stream, "200 OK", "text/html; charset=utf-8", &body).await?;
+                }
+                ApprovalRequest::Approve => {
+                    write_http_response(&mut stream, "200 OK", "text/html; charset=utf-8", "<p>승인되었습니다. Buzz로 돌아가세요.</p>").await?;
+                    return Ok(true);
+                }
+                ApprovalRequest::Deny => {
+                    write_http_response(&mut stream, "200 OK", "text/html; charset=utf-8", "<p>취소되었습니다.</p>").await?;
+                    return Ok(false);
+                }
+                ApprovalRequest::NotFound => {
+                    write_http_response(&mut stream, "404 Not Found", "text/plain; charset=utf-8", "not found").await?;
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| CliError::Timeout)?
+}
+
+const APPROVAL_CONTENT_SECURITY_POLICY: &str =
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+
+fn build_http_response(status: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: {APPROVAL_CONTENT_SECURITY_POLICY}\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+async fn write_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<(), io::Error> {
+    let response = build_http_response(status, content_type, body);
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
 }
 
 async fn cmd_target(relay_override: Option<String>, show_secret: bool) -> Result<(), CliError> {
@@ -574,6 +725,59 @@ fn parse_relay_event(text: &str, sub_id: &str) -> Option<Event> {
     serde_json::from_value(arr[2].clone()).ok()
 }
 
+fn validate_https_url(label: &str, value: &str) -> Result<(), CliError> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| CliError::Other(format!("{label} must be a valid HTTPS URL")))?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() || parsed.password().is_some() {
+        return Err(CliError::Other(format!(
+            "{label} must be a valid HTTPS URL"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct MobileCredential<'a> {
+    #[serde(rename = "relayUrl")]
+    relay_url: &'a str,
+    pubkey: &'a str,
+    nsec: &'a str,
+}
+
+fn resolve_source_payload(
+    nsec: Option<String>,
+    nsec_file: Option<PathBuf>,
+    credential_relay_url: Option<String>,
+) -> Result<(Zeroizing<String>, PayloadType), CliError> {
+    if let Some(path) = nsec_file {
+        let raw = Zeroizing::new(std::fs::read_to_string(path)?);
+        let secret =
+            SecretKey::parse(raw.trim()).map_err(|e| CliError::InvalidNsec(e.to_string()))?;
+        let keys = Keys::new(secret);
+        let nsec = Zeroizing::new(
+            keys.secret_key()
+                .to_bech32()
+                .map_err(|e| CliError::InvalidNsec(e.to_string()))?,
+        );
+        let pubkey = keys.public_key().to_hex();
+        let relay_url = credential_relay_url.as_deref().ok_or_else(|| {
+            CliError::Other("--credential-relay-url is required with --nsec-file".into())
+        })?;
+        validate_https_url("--credential-relay-url", relay_url)?;
+        let credential = MobileCredential {
+            relay_url,
+            pubkey: &pubkey,
+            nsec: &nsec,
+        };
+        let payload = serde_json::to_string(&credential)?;
+        println!("Using local key file for Buzz mobile credential payload.");
+        println!("Credential identity pubkey: {pubkey}");
+        return Ok((Zeroizing::new(payload), PayloadType::Custom));
+    }
+
+    resolve_payload(nsec)
+}
+
 /// Resolve the payload to send.
 ///
 /// If `nsec` is provided, parse it as bech32 and return the raw nsec string.
@@ -620,4 +824,92 @@ fn hex_to_32(s: &str) -> Result<[u8; 32], CliError> {
     bytes
         .try_into()
         .map_err(|_| CliError::Other(format!("expected 32 bytes, got wrong length for '{s}'")))
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+
+    #[test]
+    fn approval_request_requires_exact_one_shot_token() {
+        let token = "abc123";
+        assert_eq!(
+            classify_approval_request("GET", "/pair-approve/abc123", token),
+            ApprovalRequest::Page
+        );
+        assert_eq!(
+            classify_approval_request("POST", "/pair-approve/abc123/approve", token),
+            ApprovalRequest::Approve
+        );
+        assert_eq!(
+            classify_approval_request("POST", "/pair-approve/abc123/deny", token),
+            ApprovalRequest::Deny
+        );
+        assert_eq!(
+            classify_approval_request("POST", "/pair-approve/wrong/approve", token),
+            ApprovalRequest::NotFound
+        );
+        assert_eq!(
+            classify_approval_request("GET", "/pair-approve/abc123?x=1", token),
+            ApprovalRequest::Page
+        );
+    }
+
+    #[test]
+    fn approval_request_is_method_sensitive() {
+        let token = "abc123";
+        assert_eq!(
+            classify_approval_request("GET", "/pair-approve/abc123/approve", token),
+            ApprovalRequest::NotFound
+        );
+        assert_eq!(
+            classify_approval_request("POST", "/pair-approve/abc123", token),
+            ApprovalRequest::NotFound
+        );
+    }
+
+    #[test]
+    fn approval_http_response_sets_clickjacking_headers() {
+        let response = build_http_response("200 OK", "text/html; charset=utf-8", "<p>ok</p>");
+        assert!(response.contains(&format!(
+            "\r\nContent-Security-Policy: {APPROVAL_CONTENT_SECURITY_POLICY}\r\n"
+        )));
+        assert!(response.contains("\r\nX-Frame-Options: DENY\r\n"));
+    }
+
+    #[test]
+    fn external_approval_and_credential_urls_require_https() {
+        assert!(validate_https_url("approval", "https://buzz.example/pair-approve").is_ok());
+        assert!(validate_https_url("credential", "https://buzz.example").is_ok());
+        assert!(validate_https_url("approval", "http://buzz.example/pair-approve").is_err());
+        assert!(validate_https_url("credential", "not-a-url").is_err());
+    }
+
+    #[test]
+    fn key_file_resolves_to_mobile_custom_credential_without_logging_secret() {
+        let keys = Keys::generate();
+        let expected_pubkey = keys.public_key().to_hex();
+        let test_nsec = keys.secret_key().to_bech32().expect("test nsec");
+        let path = std::env::temp_dir().join(format!(
+            "buzz-pair-mobile-credential-{}-{}.key",
+            std::process::id(),
+            expected_pubkey
+        ));
+        std::fs::write(&path, &test_nsec).expect("write test key");
+
+        let result = resolve_source_payload(
+            None,
+            Some(path.clone()),
+            Some("https://buzz.example".to_string()),
+        );
+        let _ = std::fs::remove_file(path);
+        let (payload, payload_type) = result.expect("mobile payload");
+        assert!(matches!(payload_type, PayloadType::Custom));
+        let decoded: serde_json::Value = serde_json::from_str(&payload).expect("credential JSON");
+        assert_eq!(decoded["relayUrl"], "https://buzz.example");
+        assert_eq!(decoded["pubkey"], expected_pubkey);
+        assert!(decoded["nsec"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("nsec1")));
+    }
 }
