@@ -330,16 +330,23 @@ async fn wait_for_web_sas_confirmation(
     .map_err(|_| CliError::Timeout)?
 }
 
+const APPROVAL_CONTENT_SECURITY_POLICY: &str =
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+
+fn build_http_response(status: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: {APPROVAL_CONTENT_SECURITY_POLICY}\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 async fn write_http_response(
     stream: &mut tokio::net::TcpStream,
     status: &str,
     content_type: &str,
     body: &str,
 ) -> Result<(), io::Error> {
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    let response = build_http_response(status, content_type, body);
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await
 }
@@ -859,6 +866,15 @@ mod approval_tests {
             classify_approval_request("POST", "/pair-approve/abc123", token),
             ApprovalRequest::NotFound
         );
+    }
+
+    #[test]
+    fn approval_http_response_sets_clickjacking_headers() {
+        let response = build_http_response("200 OK", "text/html; charset=utf-8", "<p>ok</p>");
+        assert!(response.contains(&format!(
+            "\r\nContent-Security-Policy: {APPROVAL_CONTENT_SECURITY_POLICY}\r\n"
+        )));
+        assert!(response.contains("\r\nX-Frame-Options: DENY\r\n"));
     }
 
     #[test]
