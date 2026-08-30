@@ -1,0 +1,13 @@
+buzz.hojinlab.com {
+	handle /pair-approve* {
+		reverse_proxy 127.0.0.1:3097
+	}
+
+	handle /pair* {
+		reverse_proxy 127.0.0.1:3096
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:3095
+	}
+}
