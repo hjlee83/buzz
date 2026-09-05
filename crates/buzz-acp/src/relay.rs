@@ -142,22 +142,26 @@ pub struct ChannelInfo {
 
 pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
     let mut is_hidden = false;
-    let mut is_private = false;
+    let mut saw_type_tag = false;
     let mut declared_type = None;
     for tag in tags {
         if let Some(arr) = tag.as_array() {
             match arr.first().and_then(|v| v.as_str()) {
                 Some("hidden") => is_hidden = true,
-                Some("private") => is_private = true,
-                Some("t") => declared_type = arr.get(1).and_then(|v| v.as_str()),
+                Some("t") => {
+                    saw_type_tag = true;
+                    declared_type = arr.get(1).and_then(|v| v.as_str());
+                }
                 _ => {}
             }
         }
     }
-    if declared_type == Some("dm") || is_hidden {
+    if is_hidden {
         "dm".to_string()
-    } else if declared_type == Some("private") || is_private {
-        "private".to_string()
+    } else if let Some(channel_type) = declared_type {
+        channel_type.to_string()
+    } else if saw_type_tag {
+        "unknown".to_string()
     } else {
         "stream".to_string()
     }
@@ -4185,6 +4189,71 @@ mod tests {
         let meta = serde_json::json!([meta_event(channel, "dm", &["t", "dm"])]);
         let map = merge_discovered_channels(vec![channel], &meta);
         assert_eq!(map[&channel].channel_type, "dm");
+    }
+
+    #[test]
+    fn merge_discovered_channels_keeps_private_stream_as_stream() {
+        let channel = Uuid::new_v4();
+        let meta = serde_json::json!([meta_event(
+            channel,
+            "private-stream",
+            &["t", "stream", "private"],
+        )]);
+        let map = merge_discovered_channels(vec![channel], &meta);
+        assert_eq!(map[&channel].channel_type, "stream");
+    }
+
+    #[test]
+    fn merge_discovered_channels_preserves_declared_non_dm_types() {
+        for channel_type in ["forum", "workflow"] {
+            let channel = Uuid::new_v4();
+            let meta = serde_json::json!([meta_event(
+                channel,
+                channel_type,
+                &["t", channel_type, "private"],
+            )]);
+            let map = merge_discovered_channels(vec![channel], &meta);
+            assert_eq!(map[&channel].channel_type, channel_type);
+        }
+    }
+
+    #[test]
+    fn merge_discovered_channels_treats_private_without_type_as_stream() {
+        let channel = Uuid::new_v4();
+        let meta = serde_json::json!([meta_event(channel, "private-stream", &["private"])]);
+        let map = merge_discovered_channels(vec![channel], &meta);
+        assert_eq!(map[&channel].channel_type, "stream");
+    }
+
+    #[test]
+    fn merge_discovered_channels_hidden_hint_still_forces_dm() {
+        let channel = Uuid::new_v4();
+        let meta = serde_json::json!([meta_event(channel, "hidden", &["t", "stream", "hidden"],)]);
+        let map = merge_discovered_channels(vec![channel], &meta);
+        assert_eq!(map[&channel].channel_type, "dm");
+    }
+
+    #[test]
+    fn merge_discovered_channels_preserves_unknown_declared_type_for_fail_closed_gate() {
+        let channel = Uuid::new_v4();
+        let meta = serde_json::json!([meta_event(channel, "future", &["t", "future-type"])]);
+        let map = merge_discovered_channels(vec![channel], &meta);
+        assert_eq!(map[&channel].channel_type, "future-type");
+    }
+
+    #[test]
+    fn merge_discovered_channels_malformed_type_tag_stays_unknown_for_fail_closed_gate() {
+        let channel = Uuid::new_v4();
+        let meta = serde_json::json!([{
+            "tags": [
+                ["d", channel.to_string()],
+                ["name", "malformed"],
+                ["t"],
+                ["private"]
+            ]
+        }]);
+        let map = merge_discovered_channels(vec![channel], &meta);
+        assert_eq!(map[&channel].channel_type, "unknown");
     }
 
     #[test]
