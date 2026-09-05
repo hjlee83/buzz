@@ -142,12 +142,14 @@ pub struct ChannelInfo {
 
 pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
     let mut is_hidden = false;
+    let mut is_private = false;
     let mut saw_type_tag = false;
     let mut declared_type = None;
     for tag in tags {
         if let Some(arr) = tag.as_array() {
             match arr.first().and_then(|v| v.as_str()) {
                 Some("hidden") => is_hidden = true,
+                Some("private") => is_private = true,
                 Some("t") => {
                     saw_type_tag = true;
                     declared_type = arr.get(1).and_then(|v| v.as_str());
@@ -160,7 +162,7 @@ pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
         "dm".to_string()
     } else if let Some(channel_type) = declared_type {
         channel_type.to_string()
-    } else if saw_type_tag {
+    } else if saw_type_tag || is_private {
         "unknown".to_string()
     } else {
         "stream".to_string()
@@ -4218,11 +4220,11 @@ mod tests {
     }
 
     #[test]
-    fn merge_discovered_channels_treats_private_without_type_as_stream() {
+    fn merge_discovered_channels_treats_private_without_type_as_unknown() {
         let channel = Uuid::new_v4();
         let meta = serde_json::json!([meta_event(channel, "private-stream", &["private"])]);
         let map = merge_discovered_channels(vec![channel], &meta);
-        assert_eq!(map[&channel].channel_type, "stream");
+        assert_eq!(map[&channel].channel_type, "unknown");
     }
 
     #[test]
