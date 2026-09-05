@@ -472,6 +472,19 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_RESPOND_TO_ALLOWLIST", value_delimiter = ',')]
     pub respond_to_allowlist: Option<Vec<String>>,
 
+    /// Harden allowlist mode to owner + exact explicit pubkeys only.
+    ///
+    /// This is an opt-in machine-to-machine ingress boundary. It requires
+    /// `--respond-to=allowlist`, an explicit channel list, `--subscribe=mentions`,
+    /// and the normal mention filter. Same-owner sibling identities are not
+    /// implicitly trusted while this mode is active.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_RESPOND_TO_ALLOWLIST_EXACT",
+        default_value_t = false
+    )]
+    pub respond_to_allowlist_exact: bool,
+
     /// Comma-separated list of allowed `--respond-to` modes.
     /// When set, the harness rejects startup if `--respond-to` is not in this list.
     /// Modes: owner-only, allowlist, anyone, nobody.
@@ -569,6 +582,10 @@ pub struct Config {
     pub respond_to: RespondTo,
     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
     pub respond_to_allowlist: HashSet<String>,
+    /// When true, allowlist ingress is owner + exact explicit pubkeys only.
+    /// Same-owner sibling trust is disabled and startup requires explicit channel
+    /// scoping plus real mention filtering.
+    pub respond_to_allowlist_exact: bool,
     /// Allowed `respond_to` modes. Empty = all modes allowed.
     pub allowed_respond_to: Vec<String>,
     /// Per-persona env vars to inject at agent spawn time (e.g., GOOSE_PROVIDER, GOOSE_MODEL, BUZZ_AGENT_MODEL).
@@ -858,6 +875,47 @@ pub fn propagate_legacy_env_vars() {
     }
 }
 
+fn validate_exact_allowlist_mode(
+    respond_to: RespondTo,
+    exact: bool,
+    allowlist: &HashSet<String>,
+    channels: Option<&[String]>,
+    subscribe: &SubscribeMode,
+    no_mention_filter: bool,
+) -> Result<(), ConfigError> {
+    if !exact {
+        return Ok(());
+    }
+    if respond_to != RespondTo::Allowlist {
+        return Err(ConfigError::ConfigFile(
+            "--respond-to-allowlist-exact requires --respond-to=allowlist".into(),
+        ));
+    }
+    if allowlist.is_empty() {
+        return Err(ConfigError::ConfigFile(
+            "--respond-to-allowlist-exact requires a non-empty --respond-to-allowlist".into(),
+        ));
+    }
+    let has_channel =
+        channels.is_some_and(|values| values.iter().any(|value| !value.trim().is_empty()));
+    if !has_channel {
+        return Err(ConfigError::ConfigFile(
+            "--respond-to-allowlist-exact requires explicit --channels scoping".into(),
+        ));
+    }
+    if *subscribe != SubscribeMode::Mentions {
+        return Err(ConfigError::ConfigFile(
+            "--respond-to-allowlist-exact requires --subscribe=mentions".into(),
+        ));
+    }
+    if no_mention_filter {
+        return Err(ConfigError::ConfigFile(
+            "--respond-to-allowlist-exact forbids --no-mention-filter".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.
@@ -1032,7 +1090,7 @@ impl Config {
         }
 
         let respond_to_allowlist = if args.respond_to == RespondTo::Allowlist {
-            let raw = args.respond_to_allowlist.unwrap_or_default();
+            let raw = args.respond_to_allowlist.clone().unwrap_or_default();
             if raw.is_empty() {
                 return Err(ConfigError::ConfigFile(
                     "--respond-to=allowlist requires --respond-to-allowlist with at least one pubkey".into(),
@@ -1047,6 +1105,15 @@ impl Config {
             }
             HashSet::new()
         };
+
+        validate_exact_allowlist_mode(
+            args.respond_to.clone(),
+            args.respond_to_allowlist_exact,
+            &respond_to_allowlist,
+            args.channels.as_deref(),
+            &args.subscribe,
+            args.no_mention_filter,
+        )?;
 
         // Validate respond_to against the allowed set.
         let allowed_respond_to = if let Some(raw) = args.allowed_respond_to {
@@ -1133,6 +1200,7 @@ impl Config {
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
+            respond_to_allowlist_exact: args.respond_to_allowlist_exact,
             allowed_respond_to,
             persona_env_vars,
             has_generated_codex_config,
@@ -1152,7 +1220,15 @@ impl Config {
     pub fn summary(&self) -> String {
         let respond_to_detail = match &self.respond_to {
             RespondTo::Allowlist => {
-                format!("respond_to=allowlist({})", self.respond_to_allowlist.len())
+                let exact = if self.respond_to_allowlist_exact {
+                    ",exact"
+                } else {
+                    ""
+                };
+                format!(
+                    "respond_to=allowlist({}{exact})",
+                    self.respond_to_allowlist.len()
+                )
             }
             other => format!("respond_to={other}"),
         };
@@ -1506,6 +1582,7 @@ mod tests {
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
+            respond_to_allowlist_exact: false,
             allowed_respond_to: Vec::new(),
             persona_env_vars: vec![],
             has_generated_codex_config: false,
@@ -2532,6 +2609,73 @@ channels = "ALL"
             s.contains("respond_to=anyone"),
             "test_config uses Anyone, got: {s}"
         );
+    }
+
+    #[test]
+    fn test_exact_allowlist_validation_accepts_hardened_combination() {
+        let allowlist = HashSet::from(["ab".repeat(32)]);
+        let channels = vec![Uuid::new_v4().to_string()];
+        assert!(validate_exact_allowlist_mode(
+            RespondTo::Allowlist,
+            true,
+            &allowlist,
+            Some(&channels),
+            &SubscribeMode::Mentions,
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_exact_allowlist_validation_rejects_unsafe_combinations() {
+        let allowlist = HashSet::from(["ab".repeat(32)]);
+        let channels = vec![Uuid::new_v4().to_string()];
+
+        assert!(validate_exact_allowlist_mode(
+            RespondTo::OwnerOnly,
+            true,
+            &allowlist,
+            Some(&channels),
+            &SubscribeMode::Mentions,
+            false
+        )
+        .is_err());
+        assert!(validate_exact_allowlist_mode(
+            RespondTo::Allowlist,
+            true,
+            &HashSet::new(),
+            Some(&channels),
+            &SubscribeMode::Mentions,
+            false
+        )
+        .is_err());
+        assert!(validate_exact_allowlist_mode(
+            RespondTo::Allowlist,
+            true,
+            &allowlist,
+            None,
+            &SubscribeMode::Mentions,
+            false
+        )
+        .is_err());
+        assert!(validate_exact_allowlist_mode(
+            RespondTo::Allowlist,
+            true,
+            &allowlist,
+            Some(&channels),
+            &SubscribeMode::All,
+            false
+        )
+        .is_err());
+        assert!(validate_exact_allowlist_mode(
+            RespondTo::Allowlist,
+            true,
+            &allowlist,
+            Some(&channels),
+            &SubscribeMode::Mentions,
+            true
+        )
+        .is_err());
     }
 
     #[test]
