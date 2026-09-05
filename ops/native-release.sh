@@ -75,6 +75,19 @@ sudo -n true
 }
 caddy validate --config "$CADDY_TEMPLATE" --adapter caddyfile >/dev/null
 
+# Capture the service set before mutating release state. Process substitution
+# would hide `systemctl list-units` failures behind mapfile's exit status.
+active_hermes_units_raw=""
+if ! active_hermes_units_raw="$(systemctl list-units --type=service --state=active --no-legend 'buzz-hermes@*.service')"; then
+  printf 'failed to enumerate active Buzz Hermes services\n' >&2
+  exit 2
+fi
+active_hermes_units=()
+while read -r unit _; do
+  [[ -n "$unit" ]] || continue
+  active_hermes_units+=("$unit")
+done <<<"$active_hermes_units_raw"
+
 install -d -m 0755 "$INSTALL_DIR"
 backup_dir="$(mktemp -d)"
 pair_backup="$backup_dir/buzz-pair"
@@ -100,11 +113,6 @@ if sudo -n test -e "$CADDY_SITE"; then
   sudo -n cp -a "$CADDY_SITE" "$site_backup"
   had_site=1
 fi
-
-mapfile -t active_hermes_units < <(
-  systemctl list-units --type=service --state=active --no-legend 'buzz-hermes@*.service' \
-    | awk '{print $1}'
-)
 
 restart_and_verify_hermes() {
   local unit pid live_exe expected_exe
