@@ -253,11 +253,23 @@ async fn is_owner_or_sibling(
 async fn author_allowed(
     respond_to: &RespondTo,
     allowlist: &HashSet<String>,
+    exact_allowlist: bool,
     author: &str,
     is_dm: bool,
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
 ) -> bool {
+    if exact_allowlist {
+        // Strict machine-to-machine ingress deliberately does not inherit
+        // same-owner sibling trust. DMs remain owner-only because clients
+        // auto-p-tag every DM participant.
+        let is_owner = owner_cache.get() == Some(author);
+        return if is_dm {
+            is_owner
+        } else {
+            is_owner || allowlist.contains(author)
+        };
+    }
     if is_dm {
         return match respond_to {
             RespondTo::Nobody => false,
@@ -293,7 +305,18 @@ pub(crate) async fn is_dm_channel(
     channel_info: &pool::ChannelInfoResolver,
 ) -> bool {
     match channel_info.resolve_channel_metadata(channel_id).await {
-        Some(info) => info.channel_type == "dm",
+        Some(info) => match info.channel_type.as_str() {
+            "stream" | "forum" | "workflow" => false,
+            "dm" => true,
+            other => {
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    channel_type = other,
+                    "unsupported channel type — treating as DM for author gate (fail closed)"
+                );
+                true
+            }
+        },
         None => {
             tracing::warn!(
                 channel_id = %channel_id,
@@ -2877,6 +2900,7 @@ async fn tokio_main() -> Result<()> {
                                 let allowed = author_allowed(
                                     &config.respond_to,
                                     &config.respond_to_allowlist,
+                                    config.respond_to_allowlist_exact,
                                     &author,
                                     is_dm,
                                     &owner_cache,
@@ -5404,6 +5428,7 @@ mod author_gate_tests {
             author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
+                false,
                 SIBLING,
                 false,
                 &cache,
@@ -5422,6 +5447,7 @@ mod author_gate_tests {
             author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
+                false,
                 EXTERNAL,
                 false,
                 &cache,
@@ -5433,6 +5459,96 @@ mod author_gate_tests {
     }
 
     #[tokio::test]
+    async fn test_exact_allowlist_accepts_owner_and_explicit_pubkey_only() {
+        let cache = cache_with_sibling();
+        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+
+        assert!(
+            author_allowed(
+                &RespondTo::Allowlist,
+                &allowlist,
+                true,
+                OWNER,
+                false,
+                &cache,
+                &dummy_rest_client(),
+            )
+            .await
+        );
+        assert!(
+            author_allowed(
+                &RespondTo::Allowlist,
+                &allowlist,
+                true,
+                EXTERNAL,
+                false,
+                &cache,
+                &dummy_rest_client(),
+            )
+            .await
+        );
+        assert!(
+            !author_allowed(
+                &RespondTo::Allowlist,
+                &allowlist,
+                true,
+                SIBLING,
+                false,
+                &cache,
+                &dummy_rest_client(),
+            )
+            .await,
+            "strict allowlist must not inherit same-owner sibling trust"
+        );
+        assert!(
+            !author_allowed(
+                &RespondTo::Allowlist,
+                &allowlist,
+                true,
+                STRANGER,
+                false,
+                &cache,
+                &dummy_rest_client(),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_allowlist_dm_is_owner_only() {
+        let cache = cache_with_sibling();
+        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+
+        assert!(
+            author_allowed(
+                &RespondTo::Allowlist,
+                &allowlist,
+                true,
+                OWNER,
+                true,
+                &cache,
+                &dummy_rest_client(),
+            )
+            .await
+        );
+        for author in [EXTERNAL, SIBLING, STRANGER] {
+            assert!(
+                !author_allowed(
+                    &RespondTo::Allowlist,
+                    &allowlist,
+                    true,
+                    author,
+                    true,
+                    &cache,
+                    &dummy_rest_client(),
+                )
+                .await,
+                "strict allowlist DM ingress must remain owner-only"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_allowlist_rejects_non_sibling_not_in_allowlist() {
         let cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
@@ -5440,6 +5556,7 @@ mod author_gate_tests {
             !author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
+                false,
                 STRANGER,
                 false,
                 &cache,
@@ -5458,6 +5575,7 @@ mod author_gate_tests {
             author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
+                false,
                 OWNER,
                 false,
                 &cache,
@@ -5479,6 +5597,7 @@ mod author_gate_tests {
             !author_allowed(
                 &RespondTo::OwnerOnly,
                 &HashSet::new(),
+                false,
                 STRANGER,
                 false,
                 &cache,
@@ -5497,6 +5616,7 @@ mod author_gate_tests {
                 author_allowed(
                     &RespondTo::OwnerOnly,
                     &HashSet::new(),
+                    false,
                     who,
                     false,
                     &cache,
@@ -5523,6 +5643,7 @@ mod author_gate_tests {
             !author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
+                false,
                 EXTERNAL,
                 true,
                 &cache,
@@ -5540,6 +5661,7 @@ mod author_gate_tests {
             !author_allowed(
                 &RespondTo::Anyone,
                 &HashSet::new(),
+                false,
                 STRANGER,
                 true,
                 &cache,
@@ -5563,6 +5685,7 @@ mod author_gate_tests {
                     author_allowed(
                         &mode,
                         &HashSet::new(),
+                        false,
                         who,
                         true,
                         &cache,
@@ -5582,6 +5705,7 @@ mod author_gate_tests {
             !author_allowed(
                 &RespondTo::Nobody,
                 &HashSet::new(),
+                false,
                 OWNER,
                 true,
                 &cache,
@@ -5722,6 +5846,7 @@ mod author_gate_tests {
             !author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
+                false,
                 EXTERNAL,
                 is_dm,
                 &owner_cache,
@@ -6824,6 +6949,7 @@ mod build_mcp_servers_tests {
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
+            respond_to_allowlist_exact: false,
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
             has_generated_codex_config: false,
@@ -7048,6 +7174,7 @@ mod error_outcome_emission_tests {
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
+            respond_to_allowlist_exact: false,
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
             has_generated_codex_config: false,

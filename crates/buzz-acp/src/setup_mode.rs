@@ -433,6 +433,7 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         let allowed = author_allowed(
             &config.respond_to,
             &config.respond_to_allowlist,
+            config.respond_to_allowlist_exact,
             &author_hex,
             is_dm,
             &owner_cache,
