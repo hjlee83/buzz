@@ -1,0 +1,16 @@
+title = "Buzz Gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Intentional test certificate/private-key fixtures"
+paths = [
+  '''^crates/buzz-push-gateway/tests/fixtures/.*\.pem$'''
+]
+
+[[allowlists]]
+description = "Documented Kubernetes secret example with non-production sample values"
+paths = [
+  '''^deploy/charts/buzz/examples/secret-sample\.yaml$'''
+]
